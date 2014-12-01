@@ -14,3 +14,9 @@ To make this work, it requires that the rollout run time user ( which unless cha
 ```
 nobody ALL=(ALL) NOPASSWD:/usr/bin/git
 ```
+
+Notes
+=====
+This does not have to be a replacement, it can run concurrently with 212-git.
+Todo so, just rename it 213-git and change the command name from <tt>git</tt> to
+<tt>git_as</tt> -- for example.
