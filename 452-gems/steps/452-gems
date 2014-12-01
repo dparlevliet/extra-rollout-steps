@@ -1,0 +1,32 @@
+#!/usr/bin/perl -w
+# vim:tw=100 sw=2 expandtab ft=perl
+=head1 NAME
+
+452-gems
+
+=head1 DESCRIPTION
+
+Install ruby gems modules C<gems>.
+
+=head1 EXAMPLE
+
+  class Sample => {
+    gems => [ "forever" ],
+  };
+
+=head1 COPYRIGHT
+
+Copyright 2014 David Parlevliet
+
+=cut
+
+validate_config {
+  gems => {
+    type => "list",
+    help => "List of gem packages to install from Ruby package repository",
+    items => { type => "string" },
+  },
+};
+
+package_check("gems") if i_has("gems");
+command("yes w | gems", "install", $_) foreach flatten_list(c("$hostname/gems"));
