@@ -1,0 +1,32 @@
+#!/usr/bin/perl -w
+# vim:tw=100 sw=2 expandtab ft=perl
+=head1 NAME
+
+451-npm
+
+=head1 DESCRIPTION
+
+Install nodejs modules C<npm>.
+
+=head1 EXAMPLE
+
+  class Sample => {
+    npm => [ "forever" ],
+  };
+
+=head1 COPYRIGHT
+
+Copyright 2014 David Parlevliet
+
+=cut
+
+validate_config {
+  npm => {
+    type => "list",
+    help => "List of npms to install from nodejs npm repository",
+    items => { type => "string" },
+  },
+};
+
+package_check("npm") if i_has("npm");
+command("yes w | npm", "install", $_) foreach flatten_list(c("$hostname/npm"));
