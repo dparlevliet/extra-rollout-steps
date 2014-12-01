@@ -1,0 +1,1302 @@
+#!/usr/bin/perl -w
+# vim:tw=100 sw=2 expandtab ft=perl
+#
+#    Rollout
+#    Copyright (C) 2007 David Parrish
+#
+#    This program is free software; you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation; either version 2 of the License, or
+#    (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with this program; if not, write to the Free Software
+#    Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+#
+
+use strict;
+use Carp;
+use Error ':try';
+use Fcntl ':flock';
+use File::Basename;
+use Getopt::Long;
+use IO::File;
+use IO::Select;
+use POSIX 'setsid';
+use Socket;
+use Sys::Hostname;
+eval {
+  require Memoize;
+  import Memoize;
+};
+
+use vars qw( $config $verbosity $safe_mode @skip_steps @force_dangerous %networks @only_steps
+             $rollout_comment $start_time $configfile $configdir $VERSION %m $no_step_labels
+             $validate_mode $current_step );
+$VERSION = "1.2.0";
+$verbosity = 1;
+$safe_mode = 0;
+my $restore_safe_mode;
+$configdir = "/etc/rollout";
+$no_step_labels = 0;
+$config = {
+  # This is the default configuration
+  base_url => "http://rollout.domain",
+  client_certificate => "cert.pem",
+  client_certificate_key => "cert.key",
+  ca_certificate => "cacert.crt",
+};
+my $hostname = hostname;
+my @step_help;
+
+# Parse some initial options
+my @oldargv = @ARGV;
+Getopt::Long::Configure(qw( default bundling auto_version pass_through ));
+Getopt::Long::GetOptions(
+  "configdir=s"     => \$configdir,
+  "configfile=s"    => \$configfile,
+  "quiet|q"         => sub { $verbosity = 0 },
+  "verbose|v"       => sub { $verbosity++ },
+);
+@ARGV = @oldargv;
+
+# Global variables
+$hostname =~ s/\..*//;
+my(@all_steps, $steps, %steps_code);
+$configfile ||= "$configdir/rollout.cfg";
+$configfile = "$configdir/$configfile" unless $configfile =~ /^\//;
+my $log = "";
+my $pid = $$;
+
+# Exceptions {{{
+
+package RolloutException;
+use base 'Error';
+use overload ('""' => 'stringify');
+sub new {
+  my($self) = shift;
+  my $text = "". shift;
+  my @args = ();
+  local $Error::Depth = $Error::Depth + 1;
+  local $Error::Debug = 1;
+  $self->SUPER::new(-text => $text, @args);
+}
+1;
+
+package HttpException;
+use base 'RolloutException';
+1;
+
+package LocalFileException;
+use base 'RolloutException';
+1;
+
+package ConfigException;
+use base 'RolloutException';
+1;
+
+package StepHelpException;
+use base 'RolloutException';
+1;
+
+package ConfigValidationException;
+use base 'RolloutException';
+1;
+
+package ValidationCompleteException;
+use base 'RolloutException';
+1;
+
+package SafeModeException;
+use base 'RolloutException';
+1;
+
+package main;
+
+# }}}
+# Logging wrappers {{{
+my $_current_step_for_printing = "";
+sub _print_step_name {
+  return unless $current_step;
+  return if $_current_step_for_printing eq $current_step;
+  $_current_step_for_printing = $current_step;
+  print "$current_step\n";
+}
+
+sub l(@) {
+  my($text, $indent) = @_;
+  return unless $verbosity && defined $text;
+  $indent = 2 unless defined $indent;
+  _print_step_name();
+  $indent = " " x $indent;
+  my $newtext = $text;
+  $newtext =~ s/^/$indent/mg;
+  print "$newtext\n";
+  $log .= "$text\n";
+  return 0;
+}
+
+sub w(@) {
+  my($text, $indent) = @_;
+  return 1 unless $text;
+  _print_step_name();
+  $indent = 2 unless defined $indent;
+  $indent = " " x $indent;
+  my $newtext = $text;
+  $newtext =~ s/^/${indent}WARNING: /mg;
+  print "$newtext\n";
+  $log .= "$text\n";
+}
+
+sub fatal(@) {
+  _print_step_name();
+  print "------ FATAL ERROR ------\n";
+  if ($verbosity >= 3) {
+    carp "$_\n" foreach (grep { defined $_ } @_);
+  } else {
+    print "$_\n" foreach (grep { defined $_ } @_);
+  }
+  exit 1 if $current_step;
+  return 1;
+}
+
+sub d($) {
+  _print_step_name() if $verbosity >= 3;
+  eval {
+    require Data::Dumper;
+    return v(Data::Dumper::Dumper(@_)) if $verbosity >= 3;
+  };
+  return 1;
+};
+sub v(@) { l(@_) if $verbosity >= 2; return 1 }
+
+# }}}
+# RolloutHTTP package {{{
+
+package RolloutHTTP;
+
+use vars qw( $ua %per_host_certs $done_setup $use_lwp $use_sock );
+
+sub _setup {
+  return if $done_setup;
+  $done_setup = 1;
+  eval {
+    # See if LWP is supported (for HTTPS)
+    require LWP::UserAgent;
+    require LWP::ConnCache;
+    require HTTP::Request;
+    require Net::SSLeay;
+
+    *LWP::Protocol::https::_extra_sock_opts = sub {
+      my($self, $host, $port) = @_;
+      return SSL_ca_file => "$::configdir/$::config->{ca_certificate}",
+          %{$per_host_certs{"$host:$port"} || {}};
+    };
+
+    if (!$ua) {
+      $ua = new LWP::UserAgent;
+      $ua->conn_cache(new LWP::ConnCache);
+      $ua->agent("Rollout/$::VERSION");
+    }
+    $use_lwp = 1;
+  };
+  if ($@) {
+    ::w "Error loading the SSL modules. SSL is disabled. Install libwww and Net::SSLeay." if $@;
+    eval { require Net::HTTP; };
+    if ($@) {
+      $use_sock = 1;
+      ::w("Couldn't load any HTTP modules, falling back to direct socket IO. Install libwww!");
+    } else {
+    }
+  }
+}
+
+sub add_client_cert {
+  my($self, $host, $port, $cert_file, $key_file) = @_;
+  $per_host_certs{"$host:$port"} = {
+    SSL_cert_file => $cert_file,
+    SSL_key_file => $key_file,
+  };
+}
+
+sub new {
+  my($class) = @_;
+  _setup();
+  my $self = bless {}, $class;
+  return $self;
+}
+
+sub get {
+  my($self, $url, $data_cb) = @_;
+  my $len = 0;
+  if ($use_lwp) {
+    my $req = new HTTP::Request('GET', $url);
+    my $res = $ua->request($req, sub {
+      my($chunk, $res, $proto) = @_;
+      $self->{res} = $res;
+      $self->{code} = $res->code;
+      $self->{message} = $res->message;
+      $data_cb->($chunk);
+      $len += length($chunk);
+    });
+    if (!$res || !$res->is_success) {
+      $self->{message} = $res->status_line;
+      throw HttpException($res->status_line);
+    } else {
+      $self->{message} = "OK";
+    }
+  } elsif ($use_sock) {
+    require IO::Socket::INET;
+    my($protocol, $host, $port, $path) = $url =~ /^(?:(https?):\/\/)?([^\/:]+)(?::(\d+))?(\/?.*)/;
+    ::fatal("HTTPS is not supported without the Net::SSLeay module") if $protocol eq 'https';
+    my $sock = IO::Socket::INET->new(PeerAddr => $host, PeerPort => $port)
+      or ::fatal("Couldn't create socket to $host:$port");
+    print $sock "GET $path HTTP/1.0\r\n";
+    print $sock "Host: $host\r\n";
+    print $sock "\r\n";
+    chomp(my $header = <$sock>);
+    ::fatal("Error retrieving http://$host:$port/$path: $header")
+      unless $header =~ /^HTTP\/\d+\.\d+ (2\d\d) (.*)[\r\n]+$/;
+    $self->{code} = $1;
+    $self->{message} = $2;
+    while (<$sock>) {
+      # Ignore headers
+      s/[\r\n]+$//;
+      last if /^$/;
+    }
+    my $buf;
+    while (<$sock>) {
+      $data_cb->($_);
+      $len += length $_;
+    }
+    $sock->close;
+  } else {
+    my($protocol, $host, $port, $path) = $url =~ /^(?:(https?):\/\/)?([^\/:]+)(?::(\d+))?(\/?.*)/;
+    ::fatal("HTTPS is not supported without the Net::SSLeay module") if $protocol eq 'https';
+    if (!$@) {
+      my $req = new Net::HTTP Host => $host, PeerPort => $port || 80, Protocol => $protocol;
+      if (!$req) {
+        $self->{message} = $@;
+        throw HttpException($@);
+      }
+
+      $req->write_request(GET => $path, 'User-Agent' => "Rollout/$::VERSION");
+      ($self->{code}, $self->{message}) = $req->read_response_headers;
+      my $buf;
+      while (1) {
+        my $n = $req->read_entity_body($buf, 4096);
+        last unless $n;
+        $data_cb->($buf);
+        $len += $n;
+      }
+    }
+  }
+  return $len;
+}
+
+sub error_message {
+  my($self) = @_;
+  if ($use_lwp) {
+    return undef if $self->{res} && $self->{res}->is_success();
+    return $self->{message};
+  } else {
+    return $self->{message};
+  }
+}
+
+sub is_success {
+  my($self) = @_;
+  if ($use_lwp) {
+    return $self->{res}->is_success();
+  } else {
+    return $self->{code} =~ /^2../;
+  }
+}
+
+package main;
+# }}}
+sub named_params(\@$) { #{{{
+  my($params, $defaults) = @_;
+  return undef unless $params && @$params;
+  return $params->[0] if ref $params->[0] eq 'HASH' && @$params == 1;
+  my $return = {};
+
+  if (@$params % 2 != 0 || $params->[0] !~ /^-/) {
+    # Positional parameters
+    my @order;
+    for (my $i = 0; $i < @$defaults; $i += 2) {
+      my($key, $value) = ($defaults->[$i], $defaults->[$i + 1]);
+      push @order, $key;
+    }
+    return $params unless @order;
+
+    foreach (@order) {
+      last unless @$params;
+      $_ = "-$_" unless /^-/;
+      $return->{$_} = shift @$params;
+    }
+
+    return $return;
+  }
+
+  # Named parameters
+  for (my $i = 0; $i < @$defaults; $i += 2) {
+    my($key, $value) = ($defaults->[$i], $defaults->[$i + 1]);
+    $return->{$key} = $value if defined $value;
+  }
+
+  for (my $i = 0; $i < @$params; $i += 2) {
+    my($key, $value) = ($params->[$i], $params->[$i + 1]);
+    $return->{$key} = $value;
+  }
+  return $return;
+}
+#}}}
+# HTTP functions {{{
+
+sub http_file(@) {
+  my $p = named_params @_, [ -url => undef, -dest => undef ];
+  my $file = $p->{-url};
+  return undef unless $file;
+
+  my $url = $file =~ /^https?:\/\// ? $file : "$config->{base_url}/$file";
+
+  my $req = new RolloutHTTP;
+  my($protocol, $host, $port, $path) = $url =~ /^(?:(https?):\/\/)?([^\/:]+)(?::(\d+))?(\/?.*)/;
+  if ($protocol eq 'https') {
+    $ENV{HTTPS_CERT_FILE} = "$::configdir/$::config->{client_certificate}";
+    $ENV{HTTPS_KEY_FILE} = "$::configdir/$::config->{client_certificate_key}";
+    $ENV{HTTPS_CA_FILE} = "$::configdir/$::config->{ca_certificate}";
+    $req->add_client_cert($host, $port, "$::configdir/$::config->{client_certificate}",
+                          "$::configdir/$::config->{client_certificate_key}");
+  }
+
+  my $fh;
+  my $first = 1;
+  my $res = "";
+  $req->get($url, sub {
+    my($chunk) = @_;
+    if ($first) {
+      throw HttpException "GET $url returned $req->{code}" unless $req->is_success;
+      if ($p->{-dest}) {
+        v "Writing to $p->{-dest}.$$";
+        if (!($fh = new IO::File ">$p->{-dest}.$$")) {
+          throw HttpException "Can't write to $p->{-dest}.$$: $!";
+        }
+      }
+      $first = 0;
+    }
+    if ($fh) {
+      if (!$fh->write($chunk)) {
+        $fh->close;
+        unlink("$p->{-dest}.$$");
+        throw LocalFileException "Error writing to $p->{-dest}.$$: $!";
+      }
+      $res = ( $res || 0 ) + length($chunk);
+    } else {
+      $res .= $chunk;
+    }
+    return $res;
+  });
+
+  if ($p->{-dest} && $fh) {
+    $fh->close;
+    if (-f $p->{-dest} && -s $p->{-dest} && !-s "$p->{-dest}.$$") {
+      unlink "$p->{-dest}.$$";
+      throw HttpException "Not overwriting existing file with nothing";
+    }
+    throw LocalFileException "Unable to rename $p->{-dest}.$$ to $p->{-dest}" unless
+      rename("$p->{-dest}.$$", $p->{-dest});
+  }
+
+  return $res;
+}
+
+sub http_index(@) {
+  my $p = named_params @_, [ -url => undef ];
+  my $base = $p->{-url};
+  return undef unless $base;
+
+  $base .= "/" unless $base =~ /\/$/;
+
+  my $html = http_file -url => $base;
+  return () unless $html;
+
+  my @files;
+  if ($html =~ /Rolloutd File Listing/) {
+    # Internal rolloutd listing format
+    fatal "Invalid file list format from $p->{-url}" unless
+      $html =~ /<tr id='header'><th>(.*?)<\/th><\/tr>/;
+    my @fields = split /<\/th><th>/, $1;
+    while ($html =~ /<tr class='file'><td>(.*?)<\/td><\/tr>/mg) {
+      my @values = split /<\/td><td>/, $1;
+      my %entry = map { $fields[$_] => $values[$_] } 0..$#fields;
+      $entry{size} = int($entry{size} || 0);
+      $entry{mtime} = int($entry{mtime} || 0);
+      push @files, \%entry;
+    }
+  } elsif ($html =~ /^<tr>/) {
+    # Look for Apache style directory listing
+    while ($html =~ /^(?:<tr><td valign="top">)?<img src="[^"]+" alt="[^"]+">(?:<\/td><td>| )?<a href="([^"]+)">(.+?)<\/a>(?:<\/td>| )/mg) {
+      my($filename, $name) = ($1, $2);
+      next if !$filename || $name =~ /Parent Directory/i || $filename =~ /\?/;
+      push @files, {
+        filename => $filename,
+        type => ($filename =~ /\/$/) ? "directory" : "file",
+        size => 0,
+        mtime => 0,
+        checksum => "",
+      }
+    }
+  } elsif ($html =~ /^<a href="([^"]+)">(.+?)<\/a>/m) {
+    # Look for Nginx style directory listing
+    while ($html =~ /^<a href="([^"]+)">(.+?)<\/a>/mg) {
+      my($filename, $name) = ($1, $2);
+      next if !$filename || $name =~ /\.\.\//i;
+      push @files, {
+        filename => $filename,
+        type => ($filename =~ /\/$/) ? "directory" : "file",
+        size => 0,
+        mtime => 0,
+        checksum => "",
+      }
+    }
+  } else {
+    print "$html\n";
+    throw ConfigException "Can't determine which web server you're running\n";
+  }
+  return @files;
+}
+
+#}}}
+# Configuration Definition {{{
+
+sub device(*$) {
+  my($name, $block) = @_;
+  throw ConfigException "Attempt to define device \"$name\" with invalid name. ".
+        "Device names must match /^[a-z][\\w-]+$/" unless $name =~ /^[a-z][\w-]+$/;
+  $m{$name} = $block;
+  $m{$name}{ISA} ||= {};
+}
+
+sub class(*$) {
+  my($name, $block) = @_;
+  throw ConfigException "Attempt to define class \"$name\" with invalid name. ".
+        "Class names must match /^[A-Z][\\w-]+$/" unless $name =~ /^[A-Z][\w-]+$/;
+  $m{$name} = $block;
+  $m{$name}{ISA} ||= {};
+}
+
+sub network(*@) {
+  my($name, @list) = @_;
+  $networks{$name} ||= [];
+  $networks{$name} = [uniq(@{$networks{$name}}, @list)];
+}
+
+sub inherits(*;**********************************************************************************) {
+  my %h = map { $_ => 1 } @_;
+  return (ISA => \%h);
+}
+
+# }}}
+# i_* functions {{{
+
+sub i_iterate {
+  my($key, $func, $m, $donecache) = @_;
+  $m ||= $hostname;
+  $donecache ||= {};
+  my $found = 0;
+  return 0 unless $m{$m};
+  return 0 if $donecache->{$m}++;
+  if ($m{$m}->{$key}) {
+    my $x = $func->($m, $m{$m}->{$key});
+    return $found unless (defined $x);
+    $found += $x;
+  }
+  $found += i_iterate($key, $func, $_, $donecache) foreach (keys %{$m{$m}->{ISA} || {}});
+  return $found;
+}
+
+sub i_has {
+  my($class, $m) = @_;
+  # Return only the first element, which is likely to be the most specific
+  my $ret = undef;
+  i_iterate($class, sub { $ret = $_[1]; return undef });
+  return $ret;
+}
+eval { memoize('i_has') };
+
+sub _i_in {
+  my($grep) = @_;
+  return sub { return scalar(grep { $_ eq $grep } @{$_[1]}) }
+}
+
+sub i_immutable_file {
+  return i_iterate("immutable_file", _i_in($_[0]), $_[1]);
+}
+eval { memoize('i_immutable_file') };
+
+sub i_unsafe_file {
+  return i_iterate("unsafe_file", _i_in($_[0]), $_[1]);
+}
+eval { memoize('i_unsafe_file') };
+
+sub i_unsafe_dir {
+  return i_iterate("unsafe_dir", _i_in($_[0]), $_[1]);
+}
+eval { memoize('i_unsafe_dir') };
+
+sub i_should {
+  my($item, $m) = @_;
+  my $step_name = ($current_step =~ /^\d+-(.*)$/)[0];
+  my $should_not = 0;
+  i_iterate("skip_steps", sub {
+    $should_not += 1 if grep { $_ eq "$current_step:$item" } @{$_[1]};
+    $should_not += 1 if grep { $_ eq "$step_name:$item" } @{$_[1]};
+  });
+  return !$should_not;
+}
+eval { memoize('i_should') };
+
+sub i_isa {
+  my($class, $m) = @_;
+
+  $m ||= $hostname;
+  return 0 unless $m{$m} && $m{$m}->{ISA};
+  return $m{$m}->{ISA}{$class} if $m{$m}->{ISA}{$class};
+
+  foreach (keys %{$m{$m}->{ISA}}) {
+    my $ret = i_isa($class, $_);
+    return $ret if $ret;
+  }
+  return 0;
+}
+eval { memoize('i_isa') };
+
+sub get_interface_address {
+  my($iface) = @_;
+  my $socket;
+  require 'sys/ioctl.ph';
+  socket($socket, PF_INET, SOCK_STREAM, (getprotobyname('tcp'))[2]) || die "unable to create a socket: $!\n";
+  my $buf = pack('a256', $iface);
+  if (ioctl($socket, SIOCGIFADDR(), $buf) && (my @address = unpack('x20 C4', $buf))) {
+    close($socket);
+    return join('.', @address);
+  }
+  close($socket);
+  return undef;
+}
+
+sub i_ip {
+  my($host) = @_;
+  $host ||= $hostname;
+  my %interfaces = flatten_hash(c("$host/interfaces"));
+  while (my($name, $int) = each %interfaces) {
+    next unless $int->{primary};
+    next unless $int->{ip};
+    return $int->{ip};
+  }
+  return undef;
+}
+eval { memoize('i_ip') };
+
+# }}}
+# Configuration lookup functions {{{
+sub c {
+  my($key, $default, $donecache) = @_;
+  return wantarray ? () : undef unless $key;
+  $donecache ||= {};
+  my(@key) = split(/\//, $key);
+  my $base = shift @key;
+  return wantarray ? () : $default if $donecache->{$base}++;
+
+  my @ret;
+  my $x = $m{$base};
+  for (my $i = 0; $i <= $#key; $i++) {
+    last unless ref $x eq 'HASH';
+    $x = $x->{$key[$i]};
+    last unless defined($x);
+    push @ret, $x if $i == $#key;
+  }
+  if ($m{$base}->{ISA}) {
+    foreach (keys %{$m{$base}->{ISA}}) {
+      push @ret, c(join("/", $_, @key), $default, $donecache);
+    }
+  }
+  return wantarray ? @ret : ($ret[0] || $default);
+}
+eval { memoize('c') };
+
+sub uniq {
+  my(@input) = @_;
+  my @output;
+  my %done;
+  foreach (@input) {
+    next if $done{$_}++;
+    push @output, $_;
+  }
+  return @output;
+}
+
+sub merge_hashes {
+  my($x, $y) = @_;
+  return [uniq(@$x, @$y)] if ref $x eq 'ARRAY';
+  return [uniq($x, $y)] unless ref $x;
+  $x->{$_} = defined $x->{$_} ? merge_hashes($x->{$_}, $y->{$_}) : $y->{$_} foreach keys %$y;
+  return $x;
+}
+
+sub flatten_hash {
+  my(@input) = @_;
+  my $output = {};
+  $output = merge_hashes($output, $_) foreach @input;
+  return %$output;
+}
+
+sub flatten_list {
+  my(@input) = @_;
+  my @output = ();
+  foreach (@input) {
+    push @output, $_ and next unless ref $_ eq 'ARRAY';
+    push @output, @$_;
+  }
+  return @output;
+}
+
+sub flatten_list_all {
+  my(@input) = @_;
+  my @output = ();
+  foreach (@input) {
+    push @output, $_ and next unless ref $_ eq 'ARRAY';
+    push @output, flatten_all(@$_);
+  }
+  return @output;
+}
+# }}}
+# PriorityQueue {{{
+package PriorityQueue;
+
+sub new {
+  my $self = { queue => [], prios => {} };
+  return bless $self, shift();
+}
+
+sub pop {
+  my($self) = @_;
+  return undef unless @{$self->{queue}};
+  delete($self->{prios}->{$self->{queue}->[0]});
+  return shift(@{$self->{queue}});
+}
+
+sub insert {
+  my($self, $payload, $priority, $lower, $upper) = @_;
+  $lower ||= 0;
+  $upper = scalar(@{$self->{queue}}) - 1 unless defined($upper);
+  $self->{prios}->{$payload} = $priority;
+  return push(@{$self->{queue}}, $payload) unless @{$self->{queue}};
+  return push(@{$self->{queue}}, $payload) if $priority >= $self->{prios}->{$self->{queue}->[-1]};
+  return unshift(@{$self->{queue}}, $payload) if $priority < $self->{prios}->{$self->{queue}->[0]};
+  return splice(@{$self->{queue}}, 1, 0, $payload) if @{$self->{queue}} == 2;
+  my $midpoint;
+  while ($upper >= $lower) {
+    $midpoint = ($upper + $lower) >> 1;
+    if ($priority < $self->{prios}->{$self->{queue}->[$midpoint]}) {
+      $upper = $midpoint - 1;
+      next;
+    }
+    $lower = $midpoint + 1;
+  }
+
+  splice(@{$self->{queue}}, $lower, 0, $payload);
+}
+
+sub _find_payload_pos {
+  my($self, $payload) = @_;
+  my $priority = $self->{prios}->{$payload};
+  return undef unless defined($priority);
+  my $lower = 0;
+  my $upper = @{$self->{queue}} - 1;
+  my $midpoint;
+  while ($upper >= $lower) {
+    $midpoint = ($upper + $lower) >> 1;
+    if ($priority < $self->{prios}->{$self->{queue}->[$midpoint]}) {
+      $upper = $midpoint - 1;
+      next;
+    }
+    $lower = $midpoint + 1;
+  }
+  while ($lower-- >= 0) {
+    return $lower if ($self->{queue}->[$lower] eq $payload);
+  }
+}
+
+sub delete {
+  my($self, $payload) = @_;
+  my $pos = $self->_find_payload_pos($payload);
+  return undef unless defined($pos);
+  delete($self->{prios}->{$payload});
+  splice(@{$self->{queue}}, $pos, 1);
+  return $pos;
+}
+
+sub update {
+  my($self, $payload, $new_prio) = @_;
+  my $old_prio = $self->{prios}->{$payload} || 0;
+  my $old_pos = $self->delete($payload);
+  my($upper, $lower);
+  if ($new_prio - $old_prio > 0) {
+    $upper = @{$self->{queue}};
+    $lower = $old_pos;
+  } else {
+    $upper = $old_pos;
+    $lower = 0;
+  }
+  $self->insert($payload, $new_prio, $lower, $upper);
+}
+
+package main;
+
+sub queue_step {
+  my($step) = @_;
+
+  my($x) = grep /((?:\d+-)?$step)/, @all_steps;
+  fatal "Can't find step $step to queue" unless $x;
+
+  v "Queueing step $x";
+  $steps->insert($x, 0);
+}
+
+my $errors = 0;
+sub run_step {
+  my($filename) = @_;
+  validate("Attempt to run a step with no filename\n", $filename);
+  $safe_mode = $restore_safe_mode;
+  $current_step = $filename;
+  _print_step_name() unless $no_step_labels || $verbosity < 1;
+  try {
+    $steps_code{$filename} ||= http_file -url => "steps/$filename";
+  } catch HttpException with {
+    w "Can't retrieve step $filename: ". shift();
+    return;
+  };
+  try {
+    eval $steps_code{$filename};
+    if ($@) {
+      $@->throw if ref $@;
+      throw RolloutException "$@";
+    }
+  } catch ConfigException with {
+    $errors++;
+    w "Configuration error in step $filename:\n". shift();
+  } catch StepHelpException with {
+    step_help($filename, 1);
+  } catch ValidationCompleteException with {
+    return;
+  } catch Error with {
+    if ($@) {
+      l "------ FATAL ERROR ------";
+      l "$_" foreach ($@);
+      my($step, $last_step);
+      while (($step = $steps->pop())) {
+        $last_step = $step;
+      }
+      $steps->insert($last_step, 0) if $last_step;
+    }
+  } finally {
+    exit unless $pid == $$;
+  };
+}
+
+sub step_help {
+  my($filename, $indent) = @_;
+  validate("Attempt to run a step with no filename\n", $filename);
+  try {
+    $steps_code{$filename} ||= http_file -url => "steps/$filename";
+  } catch HttpException with {
+    w "Can't retrieve step $filename: ". shift();
+    return;
+  };
+  eval {
+    require Pod::Text;
+    require File::Temp;
+  };
+  fatal "Could not load Pod::Text module, step help is unavailable: $@" if $@;
+  my($outputfh, $outputfilename) = File::Temp::tempfile();
+  close $outputfh;
+  my($inputfh, $inputfilename) = File::Temp::tempfile();
+  print $inputfh $steps_code{$filename};
+  close $inputfh;
+  try {
+    my $parser = new Pod::Text;
+    $parser->parse_from_file($inputfilename, $outputfilename);
+    open(FH, "<$outputfilename") or fatal "Could not read the expected Pod::Text output file: $!";
+    my $output = join("", <FH>);
+    close(FH);
+    l $output, $indent;
+  } catch Error with {
+    fatal "The Pod::Text module installed does not support parsing from a string. Upgrade Pod::Text, or run perldoc on the Rollout server."
+  } finally {
+    unlink $inputfilename;
+    unlink $outputfilename;
+  };
+}
+
+# Adds a command to be run just before completion
+sub queue_command {
+  my($cmd, $prio) = @_;
+  $prio = 998 unless defined $prio;
+  v "Queueing command $cmd at $prio";
+  $steps->insert(sub { command($cmd) }, $prio);
+}
+
+# Adds a sub to be run just before completion
+sub queue_code {
+  my($sub, $prio) = @_;
+  $prio = 998 unless defined $prio;
+  v "Queueing code $sub at $prio";
+  $steps->insert($sub, $prio);
+}
+
+# }}}
+
+sub dangerous_step() {
+  $safe_mode = 1;
+  return unless $current_step;
+  $safe_mode = 0 if grep /^\Q$current_step\E$/, @force_dangerous;
+  my(undef, $step_name) = split /-/, $current_step, 2;
+  $safe_mode = 0 if grep /^\Q$step_name\E$/, @force_dangerous;
+}
+
+sub slurp_file($) {
+  my $file = shift;
+  local $/;
+
+  my $fh = IO::File->new($file) or throw LocalFileException "Can't open file $file: $!";
+  return <$fh>;
+}
+
+my %_done_remote_require;
+sub remote_require($;$) {
+  my($module, $optional) = @_;
+  my $filename = $module =~ /\.pm$/ ? $module : "$module.pm";
+  if (!$_done_remote_require{$filename}) {
+    $_done_remote_require{$filename} = 1;
+    my $text;
+    try {
+      $text = http_file($filename);
+    } catch HttpException with {
+      return 0 if $optional;
+      fatal "Can't load module $module: ". shift;
+    };
+    if (!$text) {
+      return 0 if $optional;
+      fatal "Can't load module $module: empty module code";
+    }
+    eval($text);
+    if ($@) {
+      return 0 if $optional;
+      fatal "Can't load module $module: $@";
+    }
+  }
+  return 1;
+}
+
+sub validate($@) {
+  my($message, @checks) = @_;
+  foreach (@checks) {
+    next if $_;
+    if ($verbosity > 1) {
+      eval {
+        require Carp;
+        $message .= Carp::longmess;
+      };
+    }
+    throw ConfigException $message;
+  }
+}
+
+sub validate_config($) {
+  remote_require "RolloutConfigValidator" or return;
+  my $validator = new RolloutConfigValidator;
+  if ($validate_mode) {
+    eval {
+      $validator->validate_config($_[0], $hostname);
+    };
+    if ($@) {
+      l $@;
+      $errors++;
+    }
+    throw ValidationCompleteException "Validation OK" if $validate_mode;
+  } else {
+    $validator->validate_config($_[0], $hostname);
+  }
+}
+
+# An optional hashref as the last argument can set custom messages:
+#   failure - print this if command fails.
+#   success - print this if command succeeds and produces output. (quiet otherwise)
+#   intro   - print this before running the command (and suppress "success")
+sub command {
+  my $flags = {};
+  $flags = pop @_ if ref $_[-1] eq 'HASH';
+
+  my $command = join " ", @_;
+  my $printed = 0;
+  $flags->{intro} ||= '';
+  $flags->{failure} ||= "FAILED: '$command' failed.";
+  $flags->{success} ||= "Finished running '$command'.";
+  $flags->{timeout} = undef unless $flags->{timeout};
+  if (exists $flags->{uid} && $flags->{uid} !~ /^\d+$/) {
+    $flags->{uid} = getpwnam $flags->{uid};
+  }
+
+  v "CMD: $command";
+  $printed++ if $verbosity > 1;
+
+  return if $safe_mode;
+
+  print $flags->{intro} if $flags->{intro};
+
+  my $cmd = IO::File->new;
+  my $child = $cmd->open('-|');
+  unless ($child) {
+    fatal "Can't fork in command: $!" unless defined $child;
+
+    $SIG{PIPE} = 'IGNORE';
+
+    # detach from controlling tty
+    setsid;
+    open STDIN, '</dev/null';
+    open(STDERR, '>&STDOUT');
+
+    # Set the UID if required
+    if ($flags->{uid}) {
+      v "SetUID $flags->{uid}";
+      $> = $flags->{uid} if $flags->{uid};
+    }
+
+    # Append sudo -u {run_as} -H to command if required
+    if ($flags->{run_as}) {
+      v "Running via sudo as $flags->{run_as}";
+      unshift @_, ("sudo", "-u", $flags->{run_as}, "-H") if $flags->{run_as};
+    }
+
+    $|=1;
+    exec @_;
+    die "Can't execute ". join (" ", @_). ": $!";
+    exit;
+  }
+
+  local $_;
+  my $timed_out = 1;
+  my $out = length $flags->{intro};
+  my $nl = $flags->{intro} =~ /\n$/;
+
+  my $s = IO::Select->new($cmd);
+  while ($s->can_read($flags->{timeout})) {
+    unless ($cmd->sysread($_, 1024)) {
+      $timed_out = 0;
+      last;
+    }
+
+    my $t;
+    $t = "  CMD: " if $nl or !$out;
+    s/\n(?=.)/\n  CMD: /g;
+    $t .= $_;
+    if (!$printed) {
+      l "CMD: $command";
+      $printed++;
+    }
+    print $t;
+    $log .= $t;
+
+    $out += length;
+    $nl = /\n$/;
+  }
+
+  if ($timed_out) {
+    print "[timeout]\n";
+    kill 15, $child;
+  } else {
+    print "\n" if $out and !$nl;
+  }
+
+  $cmd->close;
+  if ($? >> 8) {
+    l $flags->{failure}. "  Exit code: " . ($? >> 8);
+  } elsif ($?) {
+    l $flags->{failure}. "  Signal: " . ($? & 0x7f);
+  } elsif ($out and not exists $flags->{intro}) {
+    l $flags->{success};
+  }
+
+  # emulate a return of system()
+  return $?;
+}
+
+sub expand_network($) {
+  my($network) = @_;
+  return () unless $network;
+  $network =~ s/(^\[|\]$)//g;
+  return ($network) if $network =~ /^\d+\.\d+\.\d+\.\d+/;
+  return @{$networks{$network} || []};
+}
+
+sub read_config {
+  my $fh = new IO::File $configfile
+    or throw LocalFileException "Unable to read config $configfile: $!";
+  my $newconfig = {%$config};
+  while (<$fh>) {
+    s/[\r\n]+$//;
+    next if /^\s*#/;
+    my($key, $value) = split /\s*=\s*/, $_, 2;
+    next unless $key && $value;
+    $newconfig->{$key} = $value;
+  }
+  $fh->close;
+  return $config = $newconfig;
+}
+
+sub write_config {
+  eval {
+    text_install(-file => $configfile,
+                 -text => join("", map { "$_ = $config->{$_}\n" } keys %$config));
+  };
+}
+
+# Load some optional modules
+eval { require Digest::MD5 };
+w "Digest::MD5 is not installed, file checksums cannot be calculated." if $@;
+
+if (open(LOCKFILE, ">/var/run/rollout.lock")) {
+  die "There is already an instance of rollout running"
+    unless flock(LOCKFILE, LOCK_EX | LOCK_NB);
+}
+
+$start_time = time;
+try {
+  read_config();
+} catch LocalFileException with {
+  w shift();
+};
+
+sub usage {
+  require Pod::Usage;
+  Pod::Usage::pod2usage(-exitval => 1, -verbose => 99, -sections => "NAME|SYNOPSIS|OPTIONS");
+}
+
+# Read the rest of the options
+Getopt::Long::Configure(qw( default bundling auto_version ));
+Getopt::Long::GetOptions(
+  "configdir=s"     => \$configdir,
+  "configfile=s"    => \$configfile,
+  "force|f=s"       => \@force_dangerous,
+  "hostname|h=s"    => \$hostname,
+  "only|o=s"        => \@only_steps,
+  "quiet|q"         => sub {},
+  "safe_mode|s"     => \$safe_mode,
+  "skip_step|k=s"   => \@skip_steps,
+  "url|u=s"         => \$config->{base_url},
+  "verbose|v"       => sub {},
+  "no_step_labels"  => \$no_step_labels,
+  "help|?"          => \&usage,
+  "step_help|H=s"   => \@step_help,
+  "validate"        => sub { $safe_mode = 1; $validate_mode = 1; $no_step_labels = 1 },
+) or usage();
+$rollout_comment = join(" ", @ARGV) || "No comment specified";
+$rollout_comment =~ s/(^['"]|['"]$)//g;
+@ARGV = @oldargv;
+$restore_safe_mode = $safe_mode;
+
+try {
+  @all_steps = http_index "steps";
+} catch HttpException with {
+  fatal("Can't find any steps to execute: ". shift());
+  exit(1);
+};
+unshift @only_steps, "setup", "os-detection", "modifiers" if @only_steps;
+push @only_steps, "complete" if @only_steps;
+v "Only running steps: " . join(", ", @only_steps) if @only_steps;
+
+$steps = new PriorityQueue;
+foreach (@all_steps) {
+  next if $_->{type} eq 'directory';
+  next unless $_->{filename} =~ /^(\d+)-(.*)/;
+  $steps->insert($_->{filename}, int($1));
+}
+
+if (@step_help) {
+  # Show help for some steps
+  while ((my $step = $steps->pop())) {
+    next unless grep { $step =~ /^\d*-?$_$/ } @step_help;
+    step_help($step, 0);
+    print "\n";
+  }
+  exit(0);
+}
+
+# Run the first step (001-setup)
+run_step($steps->pop());
+
+# Allow steps to be reordered and duplicated
+my @reorder_steps = flatten_list(c("$hostname/rollout/reorder_steps"));
+for (my $i = 0; $i < @reorder_steps; $i += 2) {
+  $steps->update($reorder_steps[$i], $reorder_steps[$i + 1]);
+}
+my @copy_steps = flatten_list(c("$hostname/rollout/copy_steps"));
+for (my $i = 0; $i < @copy_steps; $i += 2) {
+  $steps->insert($copy_steps[$i], $copy_steps[$i + 1]);
+}
+
+while ((my $step = $steps->pop())) {
+  next if grep { $step =~ /^\d*-?$_$/ } @skip_steps;
+  next if @only_steps && !grep { $step =~ /^\d*-?$_$/ } @only_steps;
+  next unless i_should('*'); # skip_steps => [ 'foobar:*' ]
+
+  if (ref $step eq 'CODE') {
+    $step->();
+  } else {
+    run_step($step);
+  }
+}
+
+write_config();
+close(LOCKFILE);
+unlink("/var/run/rollout.lock");
+
+exit $errors;
+
+__END__
+=head1 NAME
+
+rollout - Rollout is a tool designed to automate system administration on UNIX servers.
+
+=head1 SYNOPSIS
+
+rollout [options] <message>
+
+=head1 OPTIONS
+
+=over 4
+
+=item B<--help -?>
+
+Brief help message
+
+=item B<--verbose -v>
+
+Increase verbosity
+
+=item B<--quiet -q>
+
+Don't print anything except fatal errors
+
+=item B<--safe_mode -s>
+
+Show what will be changed, but don't actually do anything
+
+=item B<--validate>
+
+Run the configuration validation part of each step, but don't actually do anything. Implies
+L<--safe_mode> and L<--no_step_labels>.
+
+=item B<--url -u> <url>
+
+Set the base Rollout HTTP url
+
+=item B<--skip_step -k> <step>
+
+Specify a step to be skipped, may be specified multiple times
+
+=item B<--hostname -h> <hostname>
+
+Rollout configuration for a different host. If -f network is provided, the
+hostname will be changed
+
+=item B<--only -o> <step>
+
+Only run a specific step (can be specified multiple times)
+
+=item B<--force -f> <step>
+
+Force a dangerous step to be run
+
+=item B<--configdir> <path>
+
+Directory to store configuration files
+
+=item B<--configfile> <filename>
+
+File to store configuration (inside configdir unless full path)
+
+=item B<--no_step_labels>
+
+Don't print the filename of each step as it's run.
+
+=back
+
+Steps which are considered dangerous are always run in safe mode, unless the -f
+parameter is specified with a step name as argument.
+
+Any additional arguments will be combined to form the 'comment' which will be
+logged.  This should be used to describe the reason for running rollout, i.e. a
+change tracking number or authorization
+
+=head1 DESCRIPTION
+
+Rollout is a system developed to automate system administration on UNIX servers.
+It is primarily focused towards Linux, but could be adapted to Solaris, HP-UX,
+AIX, etc.
+
+It is written purely in Perl, and the configuration is also a Perl source file.
+Some Perl knowledge is required to edit the configuration, but copy-and-paste
+may suffice.
+
+System Administration can generally be reduced to a set of steps, which must be
+completed in order.  Some example steps include:
+
+=over 4
+
+=item * Copy files, create symlinks
+
+=item * Edit configuration files
+
+=item * Start / stop services
+
+=item * Add / modify users & groups
+
+=item * Install applications
+
+=back
+
+The idea behind Rollout is to automate all these steps in a configurable way.
+Rollout is by design idempotent - it can be run many times on a single server
+and produce the same results.
+
+=head1 SEE ALSO
+
+=head1 COPYRIGHT
+
+Copyright 2007 David Parrish
+
+This program is free software; you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation; either version 2 of the License, or (at your option) any later
+version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE.  See the GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License along with
+this program; if not, write to the Free Software Foundation, Inc., 59 Temple
+Place, Suite 330, Boston, MA  02111-1307  USA
+
+=cut
+
+
