@@ -19,4 +19,5 @@ Notes
 =====
 This does not have to be a replacement, it can run concurrently with 212-git.
 Todo so, just rename it 213-git and change the command name from <tt>git</tt> to
-<tt>git_as</tt> -- for example.
+<tt>git_as</tt> -- for example. The modified rollout command will not break
+the existing implementations for 212-git or any other steps.
